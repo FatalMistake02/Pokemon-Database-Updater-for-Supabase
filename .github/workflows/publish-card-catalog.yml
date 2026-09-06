@@ -79,11 +79,12 @@ jobs:
         run: >-
           python github_catalog_updater.py
           --output cards-database
+          --workers 8
           --tcgdex-release "${{ steps.tcgdex_release.outputs.latest }}"
 
       - name: Refresh prices without rebuilding cards
         if: steps.tcgdex_release.outputs.changed != 'true'
-        run: python github_catalog_updater.py --output cards-database --prices-only
+        run: python github_catalog_updater.py --output cards-database --prices-only --workers 8
 
       - name: Commit and push changed catalog
         working-directory: cards-database

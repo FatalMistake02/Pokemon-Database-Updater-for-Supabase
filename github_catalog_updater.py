@@ -14,18 +14,136 @@ import importlib.util
 import json
 import re
 import sys
+import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
+from itertools import islice
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, Iterator, TypeVar
+
+import requests
 
 
 SCHEMA_VERSION = 2
+DEFAULT_FETCH_WORKERS = 8
+DEFAULT_REQUEST_DELAY = 0.1
+DEFAULT_CHECKPOINT_INTERVAL = 600.0
+CARD_FETCH_ATTEMPTS = 6
+CARD_FETCH_RETRY_DELAY = 0.5
+CARD_FETCH_MAX_RETRY_DELAY = 15.0
+CARD_FETCH_BATCH_SIZE = 256
 REGIONS = {
     "international": "data",
     "japan": "data-asia",
 }
+
+
+class RequestRateLimiter:
+    """Keep concurrent request starts separated by a minimum interval."""
+
+    def __init__(self, interval: float):
+        self.interval = interval
+        self._lock = threading.Lock()
+        self._next_start = 0.0
+
+    def wait(self) -> None:
+        if self.interval <= 0:
+            return
+        with self._lock:
+            now = time.monotonic()
+            wait_for = max(0.0, self._next_start - now)
+            self._next_start = max(now, self._next_start) + self.interval
+        if wait_for > 0:
+            time.sleep(wait_for)
+
+    def defer(self, delay: float) -> None:
+        """Pause new request starts when the upstream service is struggling."""
+        with self._lock:
+            self._next_start = max(self._next_start, time.monotonic() + delay)
+
+
+T = TypeVar("T")
+
+
+def request_with_retries(
+    operation: Callable[[], T],
+    label: str,
+    rate_limiter: RequestRateLimiter | None = None,
+) -> T:
+    """Retry transient HTTP failures and slow all workers during backoff."""
+    for attempt in range(1, CARD_FETCH_ATTEMPTS + 1):
+        if rate_limiter is not None:
+            rate_limiter.wait()
+        try:
+            return operation()
+        except requests.RequestException as exc:
+            if attempt == CARD_FETCH_ATTEMPTS:
+                raise
+            response = getattr(exc, "response", None)
+            status_code = getattr(response, "status_code", None)
+            if isinstance(status_code, int) and 400 <= status_code < 500 and status_code not in {
+                408,
+                425,
+                429,
+            }:
+                raise
+            delay = min(
+                CARD_FETCH_RETRY_DELAY * (2 ** (attempt - 1)),
+                CARD_FETCH_MAX_RETRY_DELAY,
+            )
+            retry_after = response.headers.get("Retry-After") if response is not None else None
+            try:
+                delay = max(delay, float(retry_after))
+            except (TypeError, ValueError):
+                pass
+            print(
+                f"Retrying {label} after {type(exc).__name__} "
+                f"({attempt}/{CARD_FETCH_ATTEMPTS}) in {delay:g}s",
+                file=sys.stderr,
+            )
+            if rate_limiter is not None:
+                rate_limiter.defer(delay)
+            else:
+                time.sleep(delay)
+    raise AssertionError("unreachable")
+
+
+def fetch_card_details_parallel(
+    executor: ThreadPoolExecutor,
+    source: ModuleType,
+    version: str,
+    requests_to_make: Iterable[tuple[str, str | None, Any]],
+    rate_limiter: RequestRateLimiter,
+) -> Iterator[tuple[str, Any, Exception | None]]:
+    """Fetch card details concurrently while preserving input order."""
+
+    def fetch_one(request: tuple[str, str | None, Any]) -> tuple[str, Any, Exception | None]:
+        card_id, set_id, local_id = request
+        try:
+            details = request_with_retries(
+                lambda: source.fetch_card_details(
+                    card_id,
+                    version,
+                    set_id=set_id,
+                    local_id=local_id,
+                ),
+                f"{version} card {card_id}",
+                rate_limiter,
+            )
+            return card_id, details, None
+        except Exception as exc:
+            print(
+                f"Failed to fetch {version} card {card_id} after "
+                f"{CARD_FETCH_ATTEMPTS} attempts: {exc}",
+                file=sys.stderr,
+            )
+            return card_id, None, exc
+
+    requests_iterator = iter(requests_to_make)
+    while batch := list(islice(requests_iterator, CARD_FETCH_BATCH_SIZE)):
+        yield from executor.map(fetch_one, batch)
 
 
 def load_source_module(path: Path) -> ModuleType:
@@ -59,16 +177,98 @@ def stable_id(value: Any, label: str) -> str:
     return text
 
 
+def read_existing_rows(path: Path) -> list[dict[str, Any]]:
+    """Read optional prior catalog rows for per-card failure fallback."""
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(value, list):
+        return []
+    return [row for row in value if isinstance(row, dict)]
+
+
+def prices_by_card(rows: Iterable[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        card_id = str(row.get("card_id") or "").strip()
+        if card_id:
+            grouped.setdefault(card_id, []).append(row)
+    return grouped
+
+
+class PeriodicCheckpointWriter:
+    """Write occasional snapshots without blocking upstream fetching."""
+
+    def __init__(self, region_dir: Path, interval: float):
+        self.region_dir = region_dir
+        self.interval = interval
+        self._next_write = time.monotonic() + interval if interval > 0 else 0.0
+        self._executor = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="catalog-checkpoint")
+            if interval > 0
+            else None
+        )
+        self._future: Future[None] | None = None
+
+    @staticmethod
+    def _write_snapshot(region_dir: Path, files: dict[str, list[dict[str, Any]]]) -> None:
+        for filename, rows in files.items():
+            write_json_atomic(region_dir / filename, rows)
+
+    def maybe_write(self, **files: list[dict[str, Any]]) -> bool:
+        if self._executor is None:
+            return False
+        now = time.monotonic()
+        if now < self._next_write:
+            return False
+        if self._future is not None:
+            if not self._future.done():
+                return False
+            self._future.result()
+
+        # A shallow list snapshot is enough: completed rows are not mutated again.
+        snapshots = {f"{name}.json": list(rows) for name, rows in files.items()}
+        self._future = self._executor.submit(self._write_snapshot, self.region_dir, snapshots)
+        self._next_write = now + self.interval
+        return True
+
+    def close(self) -> None:
+        if self._executor is None:
+            return
+        self._executor.shutdown(wait=True)
+        if self._future is not None:
+            self._future.result()
+
+    def __enter__(self) -> "PeriodicCheckpointWriter":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        self.close()
+
+
 def export_region(
     source: ModuleType,
     version: str,
     output_root: Path,
     limit_sets: int | None = None,
-    request_delay: float = 0.05,
+    request_delay: float = DEFAULT_REQUEST_DELAY,
+    workers: int = DEFAULT_FETCH_WORKERS,
+    checkpoint_interval: float = DEFAULT_CHECKPOINT_INTERVAL,
 ) -> dict[str, Any]:
     directory_name = REGIONS[version]
+    region_dir = output_root / directory_name
+    existing_cards = {
+        str(row.get("id")): row
+        for row in read_existing_rows(region_dir / "cards.json")
+        if row.get("id")
+    }
+    existing_card_prices = prices_by_card(read_existing_rows(region_dir / "prices.json"))
     print(f"Fetching {version} sets directly from the upstream source...")
-    summaries = source.fetch_all_sets(version)
+    summaries = request_with_retries(
+        lambda: source.fetch_all_sets(version),
+        f"{version} set list",
+    )
     if not isinstance(summaries, list):
         raise RuntimeError(f"The {version} source did not return a set list")
 
@@ -82,72 +282,144 @@ def export_region(
     cards: list[dict[str, Any]] = []
     prices: list[dict[str, Any]] = []
     seen_set_ids: set[str] = set()
+    seen_set_keys: set[str] = set()
     seen_card_ids: set[str] = set()
+    failed_card_ids: list[str] = []
 
-    for set_index, summary in enumerate(summaries, 1):
-        summary_id = stable_id(summary.get("id"), "set")
-        print(f"[{version} {set_index}/{len(summaries)}] Fetching set {summary_id}")
-        details = source.fetch_set_details(summary_id, version)
-        if not isinstance(details, dict):
-            raise RuntimeError(f"Could not fetch complete details for {version} set {summary_id}")
-        if is_pocket_set(details):
-            continue
+    rate_limiter = RequestRateLimiter(request_delay)
+    with PeriodicCheckpointWriter(region_dir, checkpoint_interval) as checkpoints:
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="card-fetch") as executor:
+            for set_index, summary in enumerate(summaries, 1):
+                summary_id = stable_id(summary.get("id"), "set")
+                print(f"[{version} {set_index}/{len(summaries)}] Fetching set {summary_id}")
+                details = request_with_retries(
+                    lambda: source.fetch_set_details(summary_id, version),
+                    f"{version} set {summary_id}",
+                )
+                if not isinstance(details, dict):
+                    raise RuntimeError(f"Could not fetch complete details for {version} set {summary_id}")
+                if is_pocket_set(details):
+                    continue
 
-        source_name = source.detect_data_source(details)
-        set_row = clean_export_row(source.transform_set_data(details, version, source_name))
-        set_id = stable_id(set_row.get("id") or summary_id, "set")
-        set_row["id"] = set_id
-        if set_id in seen_set_ids:
-            raise RuntimeError(f"Duplicate {version} set ID: {set_id}")
-        seen_set_ids.add(set_id)
+                source_name = source.detect_data_source(details)
+                set_row = clean_export_row(source.transform_set_data(details, version, source_name))
+                set_id = stable_id(set_row.get("id") or summary_id, "set")
+                set_row["id"] = set_id
+                set_key = set_id.casefold()
+                if set_key in seen_set_keys:
+                    print(
+                        f"Skipping duplicate {version} set {summary_id}; "
+                        f"it resolves to {set_id}",
+                        file=sys.stderr,
+                    )
+                    continue
+                seen_set_keys.add(set_key)
+                seen_set_ids.add(set_id)
 
-        card_summaries = (
-            source.fetch_cards_in_set(summary_id, version)
-            if version == "japan"
-            else details.get("cards", [])
-        )
-        if not isinstance(card_summaries, list):
-            raise RuntimeError(f"Set {set_id} did not return a card list")
+                card_summaries = details.get("cards", [])
+                if not isinstance(card_summaries, list):
+                    raise RuntimeError(f"Set {set_id} did not return a card list")
+                if not all(isinstance(row, dict) for row in card_summaries):
+                    raise RuntimeError(f"Set {set_id} returned an invalid card summary")
 
-        set_card_count = 0
-        for card_index, card_summary in enumerate(card_summaries, 1):
-            if not isinstance(card_summary, dict):
-                raise RuntimeError(f"Set {set_id} returned an invalid card summary")
-            card_source_id = stable_id(card_summary.get("id") or card_summary.get("uuid"), "card")
-            local_id = card_summary.get("localId") or card_summary.get("local_id")
-            details_card = source.fetch_card_details(
-                card_source_id,
-                version,
-                set_id=summary_id,
-                local_id=local_id,
-            )
-            if not isinstance(details_card, dict):
-                raise RuntimeError(f"Could not fetch complete details for {version} card {card_source_id}")
-            card_source = source.detect_data_source(details_card)
-            card_row = clean_export_row(source.transform_card_data(details_card, version, card_source))
-            card_id = stable_id(card_row.get("id") or card_source_id, "card")
-            if card_id in seen_card_ids:
-                raise RuntimeError(f"Duplicate {version} card ID: {card_id}")
-            seen_card_ids.add(card_id)
+                card_requests = [
+                    (
+                        stable_id(card_summary.get("id") or card_summary.get("uuid"), "card"),
+                        summary_id,
+                        card_summary.get("localId") or card_summary.get("local_id"),
+                    )
+                    for card_summary in card_summaries
+                ]
+                fetched_cards = fetch_card_details_parallel(
+                    executor,
+                    source,
+                    version,
+                    card_requests,
+                    rate_limiter,
+                )
 
-            card_row["id"] = card_id
-            card_row["set_id"] = set_id
-            card_row["set_name"] = card_row.get("set_name") or set_row.get("name")
-            card_row["version"] = version
-            cards.append(card_row)
-            pricing = details_card.get("pricing")
-            if isinstance(pricing, dict):
-                prices.extend(clean_export_row(row) for row in source.transform_price_data(card_id, pricing))
-            set_card_count += 1
+                set_card_count = 0
+                for card_index, (card_source_id, details_card, fetch_error) in enumerate(fetched_cards, 1):
+                    if fetch_error is not None or not isinstance(details_card, dict):
+                        failed_card_ids.append(card_source_id)
+                        existing_card = existing_cards.get(card_source_id)
+                        if existing_card is None:
+                            print(
+                                f"Skipping {version} card {card_source_id}; no prior catalog row is available",
+                                file=sys.stderr,
+                            )
+                            continue
+                        card_row = dict(existing_card)
+                        card_row["set_id"] = set_id
+                        card_row["set_name"] = card_row.get("set_name") or set_row.get("name")
+                        card_row["version"] = version
+                        card_id = stable_id(card_row.get("id") or card_source_id, "card")
+                        print(
+                            f"Preserving prior catalog data for failed {version} card {card_id}",
+                            file=sys.stderr,
+                        )
+                        prices.extend(dict(row) for row in existing_card_prices.get(card_id, []))
+                    else:
+                        try:
+                            card_source = source.detect_data_source(details_card)
+                            card_row = clean_export_row(
+                                source.transform_card_data(details_card, version, card_source)
+                            )
+                            card_id = stable_id(card_row.get("id") or card_source_id, "card")
+                        except Exception as exc:
+                            failed_card_ids.append(card_source_id)
+                            existing_card = existing_cards.get(card_source_id)
+                            if existing_card is None:
+                                print(
+                                    f"Skipping invalid {version} card {card_source_id}: {exc}",
+                                    file=sys.stderr,
+                                )
+                                continue
+                            card_row = dict(existing_card)
+                            card_id = stable_id(card_row.get("id") or card_source_id, "card")
+                            print(
+                                f"Preserving prior catalog data for invalid {version} card {card_id}: {exc}",
+                                file=sys.stderr,
+                            )
 
-            if request_delay > 0:
-                time.sleep(request_delay)
-            if card_index % 100 == 0:
-                print(f"  Fetched {card_index}/{len(card_summaries)} cards")
+                    card_id = stable_id(card_row.get("id") or card_source_id, "card")
+                    if card_id in seen_card_ids:
+                        raise RuntimeError(f"Duplicate {version} card ID: {card_id}")
+                    seen_card_ids.add(card_id)
 
-        set_row["card_count"] = set_card_count
-        set_row["version"] = version
-        sets.append(set_row)
+                    card_row["id"] = card_id
+                    card_row["set_id"] = set_id
+                    card_row["set_name"] = card_row.get("set_name") or set_row.get("name")
+                    card_row["version"] = version
+                    cards.append(card_row)
+                    if fetch_error is None and isinstance(details_card, dict):
+                        pricing = details_card.get("pricing")
+                        if isinstance(pricing, dict):
+                            try:
+                                new_prices = [
+                                    clean_export_row(row)
+                                    for row in source.transform_price_data(card_id, pricing)
+                                ]
+                                prices.extend(new_prices)
+                            except Exception as exc:
+                                failed_card_ids.append(card_source_id)
+                                prices.extend(dict(row) for row in existing_card_prices.get(card_id, []))
+                                print(
+                                    f"Preserving prior prices for invalid {version} card {card_id}: {exc}",
+                                    file=sys.stderr,
+                                )
+                    set_card_count += 1
+
+                    if card_index % 100 == 0:
+                        print(f"  Fetched {card_index}/{len(card_summaries)} cards")
+
+                set_row["card_count"] = set_card_count
+                set_row["version"] = version
+                sets.append(set_row)
+                if checkpoints.maybe_write(sets=sets, cards=cards, prices=prices):
+                    print(
+                        f"  Saving background checkpoint after {set_index}/{len(summaries)} sets"
+                    )
 
     if not cards:
         raise RuntimeError(f"The {version} export contained no cards")
@@ -157,7 +429,6 @@ def export_region(
 
     sets.sort(key=lambda row: stable_id(row.get("id"), "set"))
     cards.sort(key=lambda row: stable_id(row.get("id"), "card"))
-    region_dir = output_root / directory_name
     region_dir.mkdir(parents=True, exist_ok=True)
     write_json_atomic(region_dir / "sets.json", sets)
     write_json_atomic(region_dir / "cards.json", cards)
@@ -171,6 +442,11 @@ def export_region(
     )
     write_json_atomic(region_dir / "prices.json", prices)
     print(f"Captured {len(prices)} price rows for {version}")
+    if failed_card_ids:
+        print(
+            f"WARNING: {len(set(failed_card_ids))} {version} cards used prior data or were skipped",
+            file=sys.stderr,
+        )
 
     return {
         "version": version,
@@ -178,6 +454,8 @@ def export_region(
         "setCount": len(sets),
         "cardCount": len(cards),
         "priceCount": len(prices),
+        "failedCardCount": len(set(failed_card_ids)),
+        "failedCardIds": sorted(set(failed_card_ids)),
         "sets": file_metadata(output_root, region_dir / "sets.json"),
         "cards": file_metadata(output_root, region_dir / "cards.json"),
         "prices": file_metadata(output_root, region_dir / "prices.json"),
@@ -200,7 +478,9 @@ def export_region_prices(
     source: ModuleType,
     version: str,
     output_root: Path,
-    request_delay: float = 0.05,
+    request_delay: float = DEFAULT_REQUEST_DELAY,
+    workers: int = DEFAULT_FETCH_WORKERS,
+    checkpoint_interval: float = DEFAULT_CHECKPOINT_INTERVAL,
 ) -> dict[str, Any]:
     """Refresh prices while preserving the existing release-gated sets and cards."""
     directory_name = REGIONS[version]
@@ -210,27 +490,64 @@ def export_region_prices(
     prices_path = region_dir / "prices.json"
     sets = read_json_list(sets_path, f"{version} sets")
     cards = read_json_list(cards_path, f"{version} cards")
+    existing_card_prices = prices_by_card(read_existing_rows(prices_path))
     prices: list[dict[str, Any]] = []
+    failed_card_ids: list[str] = []
 
-    print(f"Refreshing prices for {len(cards)} existing {version} cards...")
-    for card_index, card in enumerate(cards, 1):
-        card_id = stable_id(card.get("id"), "card")
-        details = source.fetch_card_details(
-            card_id,
-            version,
-            set_id=card.get("set_id"),
-            local_id=card.get("local_id") or card.get("localId") or card.get("number"),
+    card_requests = [
+        (
+            stable_id(card.get("id"), "card"),
+            card.get("set_id"),
+            card.get("local_id") or card.get("localId") or card.get("number"),
         )
-        if not isinstance(details, dict):
-            raise RuntimeError(f"Could not fetch pricing details for {version} card {card_id}")
-        pricing = details.get("pricing")
-        if isinstance(pricing, dict):
-            prices.extend(clean_export_row(row) for row in source.transform_price_data(card_id, pricing))
+        for card in cards
+    ]
+    print(
+        f"Refreshing prices for {len(cards)} existing {version} cards "
+        f"with {workers} workers..."
+    )
+    rate_limiter = RequestRateLimiter(request_delay)
+    with PeriodicCheckpointWriter(region_dir, checkpoint_interval) as checkpoints:
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="price-fetch") as executor:
+            fetched_cards = fetch_card_details_parallel(
+                executor,
+                source,
+                version,
+                card_requests,
+                rate_limiter,
+            )
+            for card_index, (card_id, details, fetch_error) in enumerate(fetched_cards, 1):
+                if fetch_error is not None or not isinstance(details, dict):
+                    failed_card_ids.append(card_id)
+                    prices.extend(dict(row) for row in existing_card_prices.get(card_id, []))
+                    print(
+                        f"Preserving prior prices for failed {version} card {card_id}",
+                        file=sys.stderr,
+                    )
+                else:
+                    pricing = details.get("pricing")
+                    if isinstance(pricing, dict):
+                        try:
+                            new_prices = [
+                                clean_export_row(row)
+                                for row in source.transform_price_data(card_id, pricing)
+                            ]
+                            prices.extend(new_prices)
+                        except Exception as exc:
+                            failed_card_ids.append(card_id)
+                            prices.extend(dict(row) for row in existing_card_prices.get(card_id, []))
+                            print(
+                                f"Preserving prior prices for invalid {version} card {card_id}: {exc}",
+                                file=sys.stderr,
+                            )
 
-        if request_delay > 0:
-            time.sleep(request_delay)
-        if card_index % 100 == 0:
-            print(f"  Refreshed {card_index}/{len(cards)} card prices")
+                if card_index % 100 == 0:
+                    print(f"  Refreshed {card_index}/{len(cards)} card prices")
+                    if checkpoints.maybe_write(prices=prices):
+                        print(
+                            f"  Saving background price checkpoint after "
+                            f"{card_index}/{len(cards)} cards"
+                        )
 
     prices.sort(
         key=lambda row: (
@@ -242,6 +559,11 @@ def export_region_prices(
     )
     write_json_atomic(prices_path, prices)
     print(f"Captured {len(prices)} price rows for {version}; sets and cards were not rebuilt")
+    if failed_card_ids:
+        print(
+            f"WARNING: preserved prior prices for {len(set(failed_card_ids))} {version} cards",
+            file=sys.stderr,
+        )
 
     return {
         "version": version,
@@ -249,6 +571,8 @@ def export_region_prices(
         "setCount": len(sets),
         "cardCount": len(cards),
         "priceCount": len(prices),
+        "failedCardCount": len(set(failed_card_ids)),
+        "failedCardIds": sorted(set(failed_card_ids)),
         "sets": file_metadata(output_root, sets_path),
         "cards": file_metadata(output_root, cards_path),
         "prices": file_metadata(output_root, prices_path),
@@ -304,7 +628,11 @@ def publish_manifest(
 ) -> dict[str, Any]:
     version = content_version(regions)
     published_at = existing_publication_time(output_root, version) or datetime.now(timezone.utc).isoformat()
-    tcgdex_release = tcgdex_release or existing_manifest(output_root).get("tcgdexRelease")
+    prior_manifest = existing_manifest(output_root)
+    prior_release = prior_manifest.get("tcgdexRelease")
+    failed_card_count = sum(int(region.get("failedCardCount") or 0) for region in regions)
+    requested_release = tcgdex_release
+    tcgdex_release = prior_release if requested_release and failed_card_count else requested_release or prior_release
     manifest = {
         "schemaVersion": SCHEMA_VERSION,
         "version": version,
@@ -313,6 +641,8 @@ def publish_manifest(
     }
     if tcgdex_release:
         manifest["tcgdexRelease"] = tcgdex_release
+    if requested_release and failed_card_count:
+        manifest["pendingTcgdexRelease"] = requested_release
     write_json_atomic(output_root / "manifest.json", manifest)
     return manifest
 
@@ -328,7 +658,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--region", choices=("both", "international", "japan"), default="both")
     parser.add_argument("--limit-sets", type=int, help="Testing only: export the first N sets")
-    parser.add_argument("--request-delay", type=float, default=0.05)
+    parser.add_argument(
+        "--request-delay",
+        type=float,
+        default=DEFAULT_REQUEST_DELAY,
+        help=f"Minimum seconds between concurrent request starts (default: {DEFAULT_REQUEST_DELAY})",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_FETCH_WORKERS,
+        help=f"Concurrent card requests (default: {DEFAULT_FETCH_WORKERS})",
+    )
+    parser.add_argument(
+        "--checkpoint-interval",
+        type=float,
+        default=DEFAULT_CHECKPOINT_INTERVAL,
+        help=(
+            "Seconds between non-blocking file checkpoints; "
+            f"0 disables them (default: {DEFAULT_CHECKPOINT_INTERVAL:g})"
+        ),
+    )
     parser.add_argument(
         "--prices-only",
         action="store_true",
@@ -347,6 +697,10 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("--limit-sets must be at least 1")
     if args.request_delay < 0:
         raise ValueError("--request-delay cannot be negative")
+    if args.workers < 1:
+        raise ValueError("--workers must be at least 1")
+    if args.checkpoint_interval < 0:
+        raise ValueError("--checkpoint-interval cannot be negative")
     if args.prices_only and args.limit_sets is not None:
         raise ValueError("--prices-only cannot be combined with --limit-sets")
 
@@ -356,12 +710,27 @@ def main(argv: list[str] | None = None) -> int:
     versions = REGIONS if args.region == "both" else (args.region,)
     if args.prices_only:
         regions = [
-            export_region_prices(source, version, output_root, args.request_delay)
+            export_region_prices(
+                source,
+                version,
+                output_root,
+                request_delay=args.request_delay,
+                workers=args.workers,
+                checkpoint_interval=args.checkpoint_interval,
+            )
             for version in versions
         ]
     else:
         regions = [
-            export_region(source, version, output_root, args.limit_sets, args.request_delay)
+            export_region(
+                source,
+                version,
+                output_root,
+                limit_sets=args.limit_sets,
+                request_delay=args.request_delay,
+                workers=args.workers,
+                checkpoint_interval=args.checkpoint_interval,
+            )
             for version in versions
         ]
     manifest = publish_manifest(output_root, regions, args.tcgdex_release)

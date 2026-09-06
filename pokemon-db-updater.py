@@ -4,6 +4,7 @@ import json
 import hashlib
 import tempfile
 import requests
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -38,7 +39,6 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 TCGDEX_BASE_URL_EN = "https://api.tcgdex.net/v2/en"
 TCGDEX_BASE_URL_JP = "https://api.tcgdex.net/v2/ja"
-JPN_CARDS_BASE_URL = "https://www.jpn-cards.com/v2"
 
 database = None
 
@@ -66,6 +66,17 @@ JSONB_COLUMNS = {
 }
 
 DEFAULT_BATCH_SIZE = 100
+_HTTP_THREAD_LOCAL = threading.local()
+
+
+def _upstream_get(url: str, **kwargs):
+    """Reuse upstream HTTP connections independently within each worker thread."""
+    session = getattr(_HTTP_THREAD_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.headers["User-Agent"] = "Cardly-Catalog-Updater/1.0"
+        _HTTP_THREAD_LOCAL.session = session
+    return session.get(url, **kwargs)
 
 
 class SupabaseTarget:
@@ -313,11 +324,9 @@ def get_neon_database_urls() -> List[str]:
     return urls
 
 
-def get_base_url(version: str, api: str = "primary") -> str:
-    """Get the appropriate API base URL based on version and API preference."""
-    if version == "japan":
-        return JPN_CARDS_BASE_URL if api == "primary" else TCGDEX_BASE_URL_JP
-    return TCGDEX_BASE_URL_EN
+def get_base_url(version: str) -> str:
+    """Get the appropriate TCGdex API base URL for a catalog region."""
+    return TCGDEX_BASE_URL_JP if version == "japan" else TCGDEX_BASE_URL_EN
 
 
 def normalize_tcgdex_set_id(set_id: str, version: str) -> str:
@@ -339,7 +348,7 @@ def normalize_tcgdex_set_summaries(sets: List[Dict], version: str) -> List[Dict]
 
     normalized = []
     canonical_ids = {
-        str(row['id'])
+        str(row['id']).casefold()
         for row in sets
         if isinstance(row, dict)
         and row.get('id')
@@ -350,7 +359,10 @@ def normalize_tcgdex_set_summaries(sets: List[Dict], version: str) -> List[Dict]
             normalized.append(row)
             continue
         normalized_id = normalize_tcgdex_set_id(row['id'], version)
-        if normalized_id != str(row['id']) and normalized_id in canonical_ids:
+        if (
+            normalized_id != str(row['id'])
+            and normalized_id.casefold() in canonical_ids
+        ):
             print(f"Skipping duplicate {version} TCGdex set alias: {row['id']}")
             continue
         clean_row = dict(row)
@@ -359,108 +371,62 @@ def normalize_tcgdex_set_summaries(sets: List[Dict], version: str) -> List[Dict]
     return normalized
 
 
-def fetch_all_sets_jpn_cards() -> List[Dict]:
-    """Fetch all Pokemon card sets from jpn-cards API."""
-    print("Fetching all Japanese sets from jpn-cards API...")
-    try:
-        # Correct endpoint per docs: GET /v2/set/
-        response = requests.get(f"{JPN_CARDS_BASE_URL}/set/", timeout=10)
-        response.raise_for_status()
-        # jpn-cards returns a list of sets for this endpoint
-        return response.json()
-    except Exception as e:
-        print(f"Failed to fetch from jpn-cards: {e}")
-        return None
-
-
-def fetch_set_details_jpn_cards(set_id: str) -> Dict:
-    """Fetch detailed information for a specific set from jpn-cards."""
-    print(f"Fetching Japanese set details from jpn-cards for: {set_id}")
-    try:
-        # Docs show GET /v2/set/<id> (or /set/uuid/<id>), use numeric id path
-        response = requests.get(f"{JPN_CARDS_BASE_URL}/set/{set_id}", timeout=10)
-        response.raise_for_status()
-        # This endpoint returns a single set object (not wrapped in "data")
-        return response.json()
-    except Exception as e:
-        print(f"Failed to fetch set from jpn-cards: {e}")
-        return None
-
-
-def fetch_card_details_jpn_cards(card_id: str) -> Dict:
-    """Fetch detailed information for a specific card from jpn-cards."""
-    print(f"Fetching Japanese card details from jpn-cards for: {card_id}")
-    try:
-        # Per docs: GET /v2/card/id=<id>
-        response = requests.get(f"{JPN_CARDS_BASE_URL}/card/id={card_id}", timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        # The card endpoints return {"data":[ {...} ], ...}
-        if isinstance(data, dict) and 'data' in data and isinstance(data['data'], list) and len(data['data']) > 0:
-            return data['data'][0]
-        # If the API returns a single object for some reason, return it
-        if isinstance(data, dict) and 'id' in data:
-            return data
-        return None
-    except Exception as e:
-        print(f"Failed to fetch card from jpn-cards: {e}")
-        return None
-
-
 def fetch_all_sets(version: str = "international") -> List[Dict]:
-    """Fetch all Pokemon card sets from appropriate API."""
-    if version == "japan":
-        # Try jpn-cards first
-        sets = fetch_all_sets_jpn_cards()
-        if sets is not None:
-            return sets
-        # Fallback to TCGdex
-        print("Falling back to TCGdex for Japanese sets...")
-
-    base_url = get_base_url(version, "fallback")
+    """Fetch all Pokemon card sets from TCGdex."""
+    base_url = get_base_url(version)
     print(f"Fetching all {version} sets from TCGdex...")
-    response = requests.get(f"{base_url}/sets")
-    response.raise_for_status()
-    return normalize_tcgdex_set_summaries(response.json(), version)
+    response = _upstream_get(f"{base_url}/sets", timeout=(10, 30))
+    try:
+        response.raise_for_status()
+        sets = response.json()
+    except requests.RequestException as exc:
+        print(
+            f"TCGdex set list is unavailable ({exc}); deriving set IDs from the card index..."
+        )
+        cards_response = _upstream_get(f"{base_url}/cards", timeout=(10, 60))
+        cards_response.raise_for_status()
+        cards = cards_response.json()
+        if not isinstance(cards, list):
+            raise RuntimeError("TCGdex card index did not return a list")
+
+        sets_by_id = {}
+        for card in cards:
+            if not isinstance(card, dict):
+                continue
+            card_id = str(card.get('id') or '')
+            local_id = str(card.get('localId') or '')
+            suffix = f"-{local_id}"
+            if not card_id or not local_id or not card_id.endswith(suffix):
+                continue
+            set_id = card_id[:-len(suffix)]
+            if set_id:
+                sets_by_id.setdefault(set_id, {'id': set_id})
+        sets = list(sets_by_id.values())
+        if not sets:
+            raise RuntimeError("Could not derive any TCGdex set IDs from the card index")
+        print(f"Derived {len(sets)} {version} set IDs from the TCGdex card index")
+
+    if not isinstance(sets, list):
+        raise RuntimeError("TCGdex set index did not return a list")
+    return normalize_tcgdex_set_summaries(sets, version)
 
 
 def fetch_set_details(set_id: str, version: str = "international") -> Dict:
-    """Fetch detailed information for a specific set."""
-    if version == "japan":
-        # Try jpn-cards first
-        set_details = fetch_set_details_jpn_cards(set_id)
-        if set_details is not None:
-            return set_details
-        # Fallback to TCGdex
-        print(f"Falling back to TCGdex for set: {set_id}")
-
-    base_url = get_base_url(version, "fallback")
+    """Fetch detailed information for a specific set from TCGdex."""
+    base_url = get_base_url(version)
     tcgdex_set_id = normalize_tcgdex_set_id(set_id, version)
     print(f"Fetching {version} set details from TCGdex for: {tcgdex_set_id}")
-    response = requests.get(f"{base_url}/sets/{quote(tcgdex_set_id, safe='')}")
+    response = _upstream_get(f"{base_url}/sets/{quote(tcgdex_set_id, safe='')}", timeout=(10, 30))
     response.raise_for_status()
     return response.json()
 
 
 def fetch_cards_in_set(set_id: str, version: str = "international") -> List[Dict]:
-    """Fetch all cards in a specific set."""
-    if version == "japan":
-        try:
-            response = requests.get(f"{JPN_CARDS_BASE_URL}/card/set_id={set_id}", timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            # jpn-cards returns {"data":[...], ...}
-            if isinstance(data, dict) and 'data' in data and isinstance(data['data'], list):
-                return data['data']
-            return []
-        except Exception as e:
-            print(f"Falling back to TCGdex for cards in set {set_id}: {e}")
-
-
-    base_url = get_base_url(version, "fallback")
+    """Fetch all cards in a specific set from TCGdex."""
+    base_url = get_base_url(version)
     tcgdex_set_id = normalize_tcgdex_set_id(set_id, version)
     print(f"Fetching {version} cards for set from TCGdex: {tcgdex_set_id}")
-    response = requests.get(f"{base_url}/sets/{quote(tcgdex_set_id, safe='')}")
+    response = _upstream_get(f"{base_url}/sets/{quote(tcgdex_set_id, safe='')}", timeout=(10, 30))
     response.raise_for_status()
     set_data = response.json()
     return set_data.get('cards', [])
@@ -472,17 +438,9 @@ def fetch_card_details(
     set_id: Optional[str] = None,
     local_id: Optional[str] = None,
 ) -> Dict:
-    """Fetch detailed information for a specific card."""
-    if version == "japan":
-        # Try jpn-cards first
-        card_details = fetch_card_details_jpn_cards(card_id)
-        if card_details is not None:
-            return card_details
-        # Fallback to TCGdex
-        print(f"Falling back to TCGdex for card: {card_id}")
-
-    base_url = get_base_url(version, "fallback")
-    response = requests.get(f"{base_url}/cards/{card_id}")
+    """Fetch detailed information for a specific card from TCGdex."""
+    base_url = get_base_url(version)
+    response = _upstream_get(f"{base_url}/cards/{card_id}", timeout=(10, 30))
     try:
         response.raise_for_status()
     except requests.HTTPError:
@@ -496,7 +454,7 @@ def fetch_card_details(
         canonical_set_id = normalize_tcgdex_set_id(set_id, version)
         canonical_card_id = f"{canonical_set_id}-{canonical_local_id}"
         encoded_card_id = quote(canonical_card_id, safe="")
-        response = requests.get(f"{base_url}/cards/{encoded_card_id}")
+        response = _upstream_get(f"{base_url}/cards/{encoded_card_id}", timeout=(10, 30))
         response.raise_for_status()
     return response.json()
 
@@ -719,8 +677,8 @@ def transform_price_data(card_id: str, pricing_data: Dict) -> List[Dict]:
     price_records = []
 
     # Process Cardmarket pricing
-    if 'cardmarket' in pricing_data:
-        cm = pricing_data['cardmarket']
+    cm = pricing_data.get('cardmarket')
+    if isinstance(cm, dict):
         updated = cm.get('updated')
 
         # Regular/average prices
@@ -753,14 +711,14 @@ def transform_price_data(card_id: str, pricing_data: Dict) -> List[Dict]:
             })
 
     # Process TCGPlayer pricing
-    if 'tcgplayer' in pricing_data:
-        tcp = pricing_data['tcgplayer']
+    tcp = pricing_data.get('tcgplayer')
+    if isinstance(tcp, dict):
         updated = tcp.get('updated')
         unit = tcp.get('unit', 'USD')
 
         # Normal prices
-        if 'normal' in tcp:
-            normal = tcp['normal']
+        normal = tcp.get('normal')
+        if isinstance(normal, dict):
             price_records.append({
                 'card_id': card_id,
                 'market_source': 'tcgplayer',
@@ -776,8 +734,8 @@ def transform_price_data(card_id: str, pricing_data: Dict) -> List[Dict]:
             })
 
         # Reverse holo prices
-        if 'reverse' in tcp:
-            reverse = tcp['reverse']
+        reverse = tcp.get('reverse')
+        if isinstance(reverse, dict):
             price_records.append({
                 'card_id': card_id,
                 'market_source': 'tcgplayer',
@@ -793,8 +751,8 @@ def transform_price_data(card_id: str, pricing_data: Dict) -> List[Dict]:
             })
 
         # Holofoil prices
-        if 'holofoil' in tcp:
-            holo = tcp['holofoil']
+        holo = tcp.get('holofoil')
+        if isinstance(holo, dict):
             price_records.append({
                 'card_id': card_id,
                 'market_source': 'tcgplayer',
@@ -810,8 +768,8 @@ def transform_price_data(card_id: str, pricing_data: Dict) -> List[Dict]:
             })
 
         # 1st Edition prices
-        if '1stEdition' in tcp:
-            first_ed = tcp['1stEdition']
+        first_ed = tcp.get('1stEdition')
+        if isinstance(first_ed, dict):
             price_records.append({
                 'card_id': card_id,
                 'market_source': 'tcgplayer',
@@ -1066,7 +1024,7 @@ def upsert_prices(card_id: str, pricing_data: Dict) -> int:
 def seed_all_data(limit_sets: Optional[int] = None, version: str = "international"):
     """
     Main function to seed all data from APIs to Supabase.
-    For Japanese cards, tries jpn-cards API first, then falls back to TCGdex.
+    Both international and Japanese cards are fetched from TCGdex.
     
     Args:
         limit_sets: Optional limit on number of sets to process (for testing)
@@ -1074,10 +1032,7 @@ def seed_all_data(limit_sets: Optional[int] = None, version: str = "internationa
     """
     print("="*60)
     print(f"Starting seeding process ({version})")
-    if version == "japan":
-        print("Primary API: jpn-cards.com (fallback: TCGdex)")
-    else:
-        print("API: TCGdex")
+    print("API: TCGdex")
     print("="*60)
     
     # Fetch all sets
@@ -1215,9 +1170,6 @@ def seed_single_set(set_id: str, version: str = "international"):
         return
 
     tqdm.write(f"Seeding single {version} set: {set_id}")
-    if version == "japan":
-        tqdm.write("Trying jpn-cards API first, will fallback to TCGdex if needed")
-
     try:
         # Fetch and upsert set
         set_details = fetch_set_details(set_id, version)

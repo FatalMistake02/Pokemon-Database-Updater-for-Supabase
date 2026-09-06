@@ -24,7 +24,7 @@ class CardDetailFetchTests(unittest.TestCase):
         found.raise_for_status.return_value = None
         found.json.return_value = {"id": "exu-?", "name": "Unown"}
 
-        with patch.object(MODULE.requests, "get", side_effect=[missing, found]) as get:
+        with patch.object(MODULE, "_upstream_get", side_effect=[missing, found]) as get:
             result = MODULE.fetch_card_details("exu-?", set_id="exu", local_id="?")
 
         self.assertEqual(result["id"], "exu-?")
@@ -40,7 +40,7 @@ class CardDetailFetchTests(unittest.TestCase):
         found.raise_for_status.return_value = None
         found.json.return_value = {"id": "exu-%3F", "name": "Unown"}
 
-        with patch.object(MODULE.requests, "get", side_effect=[missing, found]) as get:
+        with patch.object(MODULE, "_upstream_get", side_effect=[missing, found]) as get:
             MODULE.fetch_card_details("exu-%3F", set_id="exu", local_id="%3F")
 
         self.assertEqual(
@@ -52,45 +52,82 @@ class CardDetailFetchTests(unittest.TestCase):
         failed = Mock(status_code=503)
         failed.raise_for_status.side_effect = requests.HTTPError("unavailable")
 
-        with patch.object(MODULE.requests, "get", return_value=failed) as get:
+        with patch.object(MODULE, "_upstream_get", return_value=failed) as get:
             with self.assertRaises(requests.HTTPError):
                 MODULE.fetch_card_details("exu-?", set_id="exu", local_id="?")
 
         get.assert_called_once()
 
 
+class SetListFallbackTests(unittest.TestCase):
+    def test_set_ids_are_derived_from_card_index_when_set_list_is_unavailable(self):
+        unavailable = Mock(status_code=503)
+        unavailable.raise_for_status.side_effect = requests.HTTPError(
+            "unavailable",
+            response=unavailable,
+        )
+        card_index = Mock(status_code=200)
+        card_index.raise_for_status.return_value = None
+        card_index.json.return_value = [
+            {"id": "base1-4", "localId": "4", "name": "Charizard"},
+            {"id": "base1-5", "localId": "5", "name": "Clefairy"},
+            {"id": "tk-xy-n-6", "localId": "6", "name": "Energy"},
+            {"id": "invalid", "name": "Missing local ID"},
+        ]
+
+        with patch.object(MODULE, "_upstream_get", side_effect=[unavailable, card_index]) as get:
+            result = MODULE.fetch_all_sets("international")
+
+        self.assertEqual(result, [{"id": "base1"}, {"id": "tk-xy-n"}])
+        self.assertEqual(get.call_args_list[1].args[0], "https://api.tcgdex.net/v2/en/cards")
+        self.assertEqual(get.call_args_list[1].kwargs["timeout"], (10, 60))
+
+
 class JapaneseSetAliasTests(unittest.TestCase):
     def test_japanese_plus_set_detail_uses_card_bearing_tcgdex_id(self):
-        missing_jpn_cards = Mock()
-        missing_jpn_cards.raise_for_status.side_effect = requests.HTTPError("not found")
         found = Mock()
         found.raise_for_status.return_value = None
         found.json.return_value = {"id": "SM1p", "cards": []}
 
-        with patch.object(MODULE.requests, "get", side_effect=[missing_jpn_cards, found]) as get:
+        with patch.object(MODULE, "_upstream_get", return_value=found) as get:
             result = MODULE.fetch_set_details("SM1+", "japan")
 
         self.assertEqual(result["id"], "SM1p")
         self.assertEqual(
-            get.call_args_list[1].args[0],
+            get.call_args.args[0],
             "https://api.tcgdex.net/v2/ja/sets/SM1p",
         )
+        self.assertEqual(get.call_count, 1)
 
-    def test_japanese_plus_set_card_fallback_uses_card_bearing_tcgdex_id(self):
-        missing_jpn_cards = Mock()
-        missing_jpn_cards.raise_for_status.side_effect = requests.HTTPError("not found")
+    def test_japanese_plus_set_cards_use_card_bearing_tcgdex_id(self):
         found = Mock()
         found.raise_for_status.return_value = None
         found.json.return_value = {"id": "SM1p", "cards": [{"id": "SM1p-001"}]}
 
-        with patch.object(MODULE.requests, "get", side_effect=[missing_jpn_cards, found]) as get:
+        with patch.object(MODULE, "_upstream_get", return_value=found) as get:
             result = MODULE.fetch_cards_in_set("SM1+", "japan")
 
         self.assertEqual(result, [{"id": "SM1p-001"}])
         self.assertEqual(
-            get.call_args_list[1].args[0],
+            get.call_args.args[0],
             "https://api.tcgdex.net/v2/ja/sets/SM1p",
         )
+        self.assertEqual(get.call_count, 1)
+
+    def test_japanese_card_details_go_directly_to_tcgdex(self):
+        found = Mock()
+        found.raise_for_status.return_value = None
+        found.json.return_value = {"id": "SM1p-001"}
+
+        with patch.object(MODULE, "_upstream_get", return_value=found) as get:
+            result = MODULE.fetch_card_details("SM1p-001", "japan")
+
+        self.assertEqual(result["id"], "SM1p-001")
+        self.assertEqual(
+            get.call_args.args[0],
+            "https://api.tcgdex.net/v2/ja/cards/SM1p-001",
+        )
+        self.assertEqual(get.call_count, 1)
 
     def test_tcgdex_set_index_collapses_plus_alias(self):
         response = Mock()
@@ -98,14 +135,43 @@ class JapaneseSetAliasTests(unittest.TestCase):
         response.json.return_value = [
             {"id": "SM1+", "name": "Sun & Moon"},
             {"id": "SM1p", "name": "Sun & Moon"},
+            {"id": "sm2+", "name": "Beyond a New Challenge"},
+            {"id": "SM2p", "name": "Beyond a New Challenge"},
             {"id": "SM1M", "name": "Collection Moon"},
         ]
 
-        with patch.object(MODULE, "fetch_all_sets_jpn_cards", return_value=None):
-            with patch.object(MODULE.requests, "get", return_value=response):
-                result = MODULE.fetch_all_sets("japan")
+        with patch.object(MODULE, "_upstream_get", return_value=response):
+            result = MODULE.fetch_all_sets("japan")
 
-        self.assertEqual([row["id"] for row in result], ["SM1p", "SM1M"])
+        self.assertEqual([row["id"] for row in result], ["SM1p", "SM2p", "SM1M"])
+
+
+class PriceTransformationTests(unittest.TestCase):
+    def test_null_market_providers_are_ignored(self):
+        pricing = {"cardmarket": None, "tcgplayer": None}
+
+        self.assertEqual(MODULE.transform_price_data("card-1", pricing), [])
+
+    def test_null_tcgplayer_variants_are_ignored(self):
+        pricing = {
+            "cardmarket": None,
+            "tcgplayer": {
+                "updated": "2026-09-06",
+                "unit": "USD",
+                "normal": None,
+                "reverse": {"lowPrice": 1.25, "marketPrice": 2.5},
+                "holofoil": None,
+                "1stEdition": None,
+            },
+        }
+
+        result = MODULE.transform_price_data("card-1", pricing)
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["market_source"], "tcgplayer")
+        self.assertEqual(result[0]["price_type"], "reverse")
+        self.assertEqual(result[0]["low"], 1.25)
+        self.assertEqual(result[0]["market"], 2.5)
 
 
 class RecordingDatabase:
