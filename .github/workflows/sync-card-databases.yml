@@ -1,0 +1,169 @@
+name: Sync Published Card Database
+
+on:
+  schedule:
+    - cron: "17 3,15 * * *"
+  workflow_dispatch:
+    inputs:
+      prices_only:
+        description: Update prices without replacing sets and cards
+        type: boolean
+        required: true
+        default: false
+      catalog_version:
+        description: Optional exact manifest version to wait for
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-published-card-database
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      DATABASE_URL_2: ${{ secrets.DATABASE_URL_2 }}
+      DATABASE_URLS: ${{ secrets.DATABASE_URLS }}
+      CARD_CATALOG_URL: ${{ vars.CARD_CATALOG_URL || 'https://cardlyapp.github.io/cards-database' }}
+    steps:
+      - name: Check out database loader
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Wait for scheduled public database build
+        if: github.event_name == 'schedule'
+        id: public_build
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import time
+          from datetime import datetime, timedelta, timezone
+
+          import requests
+
+          api_url = (
+              "https://api.github.com/repos/Cardlyapp/cards-database/"
+              "actions/workflows/update-database.yml/runs?per_page=10"
+          )
+          cutoff = datetime.now(timezone.utc) - timedelta(hours=6)
+          deadline = time.monotonic() + (3 * 60 * 60)
+          ready = False
+
+          while True:
+              response = requests.get(
+                  api_url,
+                  headers={"Accept": "application/vnd.github+json", "User-Agent": "Cardly-Database-Sync"},
+                  timeout=30,
+              )
+              response.raise_for_status()
+              runs = response.json().get("workflow_runs", [])
+              recent = []
+              for run in runs:
+                  created_at = datetime.fromisoformat(run["created_at"].replace("Z", "+00:00"))
+                  if created_at >= cutoff:
+                      recent.append(run)
+
+              if recent:
+                  run = recent[0]
+                  if run.get("status") == "completed":
+                      ready = run.get("conclusion") == "success"
+                      print(
+                          f"Public database workflow completed with "
+                          f"{run.get('conclusion')}: {run.get('html_url')}"
+                      )
+                      break
+                  print(f"Public database workflow is {run.get('status')}; waiting five minutes...")
+              else:
+                  print("No recent public database workflow is visible; waiting five minutes...")
+
+              if time.monotonic() >= deadline:
+                  print("Timed out waiting for a successful public database workflow")
+                  break
+              time.sleep(300)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"ready={'true' if ready else 'false'}\n")
+          PY
+
+      - name: Read completed catalog manifest
+        if: github.event_name == 'workflow_dispatch' || steps.public_build.outputs.ready == 'true'
+        id: catalog
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import time
+
+          import requests
+
+          base_url = os.environ["CARD_CATALOG_URL"].rstrip("/")
+          response = requests.get(
+              f"{base_url}/manifest.json",
+              params={"read": str(time.time_ns())},
+              timeout=30,
+          )
+          response.raise_for_status()
+          manifest = response.json()
+          version = str(manifest.get("version") or "")
+          update_type = str(manifest.get("updateType") or "full")
+          if not version or update_type not in {"full", "prices"}:
+              raise RuntimeError("The published catalog manifest is incomplete")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write("ready=true\n")
+              output.write(f"version={version}\n")
+              output.write(f"update_type={update_type}\n")
+          print(f"Catalog {version[:12]} requests a {update_type} database update")
+          PY
+
+      - name: Bulk update cards and prices
+        if: >-
+          steps.catalog.outputs.ready == 'true' &&
+          ((github.event_name == 'schedule' && steps.catalog.outputs.update_type == 'full') ||
+          (github.event_name == 'workflow_dispatch' && inputs.prices_only != true))
+        shell: bash
+        env:
+          EXPECTED_VERSION: ${{ inputs.catalog_version || steps.catalog.outputs.version }}
+        run: |
+          python pokemon-db-updater.py \
+            --catalog-url "$CARD_CATALOG_URL" \
+            --expected-catalog-version "$EXPECTED_VERSION" \
+            --db-target both \
+            --version both \
+            --batch-size 100
+
+      - name: Update prices only
+        if: >-
+          steps.catalog.outputs.ready == 'true' &&
+          ((github.event_name == 'schedule' && steps.catalog.outputs.update_type == 'prices') ||
+          (github.event_name == 'workflow_dispatch' && inputs.prices_only == true))
+        shell: bash
+        env:
+          EXPECTED_VERSION: ${{ inputs.catalog_version || steps.catalog.outputs.version }}
+        run: |
+          python pokemon-db-updater.py \
+            --catalog-url "$CARD_CATALOG_URL" \
+            --expected-catalog-version "$EXPECTED_VERSION" \
+            --prices-only \
+            --db-target both \
+            --version both \
+            --batch-size 100

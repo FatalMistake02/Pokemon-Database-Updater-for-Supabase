@@ -1325,6 +1325,10 @@ if __name__ == "__main__":
         help="Wait until --catalog-url publishes the version in this local manifest.",
     )
     parser.add_argument(
+        "--expected-catalog-version",
+        help="Wait until --catalog-url publishes this exact manifest version.",
+    )
+    parser.add_argument(
         "--prices-catalog",
         type=Path,
         help="Optional alternate root for prices.json files (defaults to --catalog).",
@@ -1343,6 +1347,12 @@ if __name__ == "__main__":
         parser.error("Use either --catalog or --catalog-url, not both")
     if args.expected_catalog_manifest and not args.catalog_url:
         parser.error("--expected-catalog-manifest requires --catalog-url")
+    if args.expected_catalog_version and not args.catalog_url:
+        parser.error("--expected-catalog-version requires --catalog-url")
+    if args.expected_catalog_manifest and args.expected_catalog_version:
+        parser.error(
+            "Use either --expected-catalog-manifest or --expected-catalog-version, not both"
+        )
     if args.prices_catalog and not (args.catalog or args.catalog_url):
         parser.error("--prices-catalog requires --catalog or --catalog-url")
     if (args.catalog or args.catalog_url) and (args.set_id or args.limit):
@@ -1381,7 +1391,7 @@ if __name__ == "__main__":
         temporary = tempfile.TemporaryDirectory() if args.catalog_url else None
         try:
             if args.catalog_url:
-                expected_version = None
+                expected_version = args.expected_catalog_version
                 if args.expected_catalog_manifest:
                     expected_manifest = json.loads(
                         args.expected_catalog_manifest.read_text(encoding="utf-8")

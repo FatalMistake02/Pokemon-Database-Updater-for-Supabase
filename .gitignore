@@ -4,8 +4,7 @@
 !pokemon-db-updater.py
 !pokedex-updater.py
 !product-updater.py
-!github_catalog_updater.py
-!CATALOG_EXPORT.md
+!CATALOG_SYNC.md
 !.github/
 !.github/**
 !requirements.txt
